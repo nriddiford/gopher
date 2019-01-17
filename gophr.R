@@ -14,7 +14,8 @@ library(tidyr)
 library(RColorBrewer)
 library(pheatmap)
 library(GO.db)
-
+library(forcats)
+library(GSEABase)
 
 cleanTheme <- function(base_size = 12) {
   theme(
@@ -71,16 +72,21 @@ get_data <- function(..., in_file = NULL, mut_type='sv'){
     dplyr::mutate(cell_fraction = ifelse(chrom %in% c('X', 'Y'), af,
                                          ifelse(af*2>1, 1, af*2))) %>%
     dplyr::filter(...) %>% 
+    dplyr::distinct(sample, gene, .keep_all=TRUE) %>% 
     droplevels()
   
   return(genes)
 }
 
-do_goSeq <- function(..., gene_uni='~/Desktop/script_test/svBreaks/inst/extdata/gene_lengths.txt',
+go_getter <- function(..., gene_uni='~/Desktop/script_test/svBreaks/inst/extdata/gene_lengths.txt',
                      hit_genes=NULL,
-                     go_class=c("GO:BP", "GO:MF", "GO:CC"), by_sample=TRUE, p_threshold=0.005, cf=0.1, mut_type='sv') {
+                     excluded_genes=NULL,
+                     go_class=c("GO:BP", "GO:MF", "GO:CC"), by_sample=TRUE, p_threshold=0.005, mut_type='sv') {
   
   if(missing(hit_genes)) stop("Option 'hit_genes' required")
+  if(missing(excluded_genes)){
+    excluded_genes <- c()
+  }
   
   gene_lengths <- read.delim(gene_uni, header = T)
   
@@ -88,10 +94,6 @@ do_goSeq <- function(..., gene_uni='~/Desktop/script_test/svBreaks/inst/extdata/
     dplyr::filter(!gene %in% excluded_genes) %>% 
     dplyr::select(gene) %>% 
     droplevels()
-  
-  hit_genes <- hit_genes %>% 
-    dplyr::filter(!gene %in% excluded_genes,
-                  cell_fraction>=cf)
   
   genes_per_sample <- function(filter_sample=NULL, genes=hit_genes, term_filt=go_class) {
     if(missing(filter_sample)){
@@ -184,7 +186,7 @@ go_figure <- function(..., combined=NULL, go_class=c("BP", "MF", "CC"), p_thresh
   
   ### This rescales within go_term
   tallied_terms <- df %>%
-    # dplyr::filter(...) %>% 
+    dplyr::filter(...) %>% 
     dplyr::mutate(value = ifelse(is.na(value), 1, value)) %>% 
     dplyr::group_by(sample) %>% 
     dplyr::arrange(value) %>% 
@@ -199,7 +201,7 @@ go_figure <- function(..., combined=NULL, go_class=c("BP", "MF", "CC"), p_thresh
     # dplyr::ungroup() %>% # To perform global rescale
     # dplyr::mutate(rescale = ifelse(count >= n_samples, rescale(-value), 0)) %>% 
     dplyr::filter(count >= n_samples) %>% 
-    # dplyr::ungroup() %>% # To perform global rescale
+    dplyr::ungroup() %>% # To perform global rescale
     dplyr::mutate(rescale = rescale(-value)) %>% 
     dplyr::arrange(-count)
   
@@ -276,6 +278,90 @@ go_figure <- function(..., combined=NULL, go_class=c("BP", "MF", "CC"), p_thresh
 }
 
 
+
+gopher_broke <- function(..., combined, slim_file = 'goslim.obo', go_class='BP', direction='over', print=FALSE, evidenceCode="TAS"){
+  if(!direction %in% c('over', 'under')) stop("Direction must be set to 'over' or 'under'. Exciting")
+  
+  replacer = 'under'
+  if (direction == 'under'){
+    replacer = 'over'
+  }
+  
+  cleaned <- combined %>% 
+    dplyr::filter(ontology == go_class) %>% 
+    dplyr::select(-contains(replacer)) %>% 
+    dplyr::mutate(term = gsub("'", '', term)) %>% 
+    dplyr::select(-ontology, -term) %>% 
+    droplevels()
+  
+  colnames(cleaned) <- gsub(x = names(cleaned), pattern = "_.*", replacement = "")
+  
+  df <- reshape2::melt(cleaned, id='GO') %>% 
+    dplyr::mutate(sample = as.factor(variable),
+                  go_term = GO) %>% 
+    dplyr::select(-GO, -variable)
+  
+  filtered_terms <- df %>%
+    # dplyr::filter(...) %>% 
+    dplyr::mutate(value = ifelse(is.na(value), 1, value)) %>% 
+    dplyr::group_by(sample) %>% 
+    dplyr::arrange(value) %>% 
+    dplyr::distinct(go_term, .keep_all=TRUE) %>% 
+    dplyr::filter(value < 1)
+  
+  slims_per_sample <- list()
+  for(s in levels(filtered_terms$sample)){
+    cat(s, "\n")
+    sample_terms <- filtered_terms %>%
+      dplyr::filter(sample == s)
+    
+    go_terms <- sample_terms$go_term
+    myCollection <- GOCollection(go_terms)
+    
+    slim <- getOBOCollection(slim_file)
+    slim_counts <- goSlim(myCollection, slim, go_class, evidenceCode %in% evidenceCode)
+    
+    slims_per_sample[[s]] <- data.frame(sample = s, term=slim_counts$Term, percent = slim_counts$Percent, count=slim_counts$Count)
+  }
+  
+  all_slims <- do.call(rbind, slims_per_sample)
+  rownames(all_slims) <- NULL
+  
+  present_terms <- all_slims %>% 
+    dplyr::filter(count > 0) %>% 
+    dplyr::group_by(term) %>% 
+    dplyr::mutate(across_samples = n()) %>% 
+    dplyr::group_by(sample) %>%
+    dplyr::mutate(score = rescale(percent)) %>% 
+    dplyr::top_n(10, percent)
+  
+  wide_tally <- present_terms %>%
+    dplyr::select(term, sample, percent) %>% 
+    # unite(var, go_term, sample) %>% 
+    tidyr::spread(sample, percent)
+  
+  wt_copy <- wide_tally
+  wide_tally$term <- NULL
+  wide_tally[is.na(wide_tally)] <- 0
+  m1 <- as.matrix(wide_tally)
+  
+  rownames(m1) <- wt_copy$term
+  
+  breaksList = seq(0, 100, by = 20)
+  
+  if(direction=='under'){
+    colours <- colorRampPalette(brewer.pal(n = 5, name = "Reds"))(length(breaksList))
+  } else{
+    colours <- colorRampPalette(brewer.pal(n = 5, name = "Blues"))(length(breaksList))
+  }
+  pheatmap::pheatmap(m1, color = colours, cutree_rows = 3, cutree_cols = 3)
+  
+  if(print){
+    return(present_terms)
+  }
+  
+}
+
 printGO <- function(x){
   for(go in x){
     print(GOTERM[[go]])
@@ -290,7 +376,7 @@ printGO <- function(x){
 #' @param burrow Print GO descriptions for each gene in list [binary]
 #' @param tunnel Print the list of GO terms [binary]
 #' @param waffle Limit the number of terms/desriptions to top N [int]
-gophr_broke <- function(genes, burrow=FALSE, waffle=NULL, tunnel=FALSE, go_class=c("GO:BP", "GO:MF", "GO:CC")){
+go_home <- function(genes, burrow=FALSE, waffle=NULL, tunnel=FALSE, go_class=c("GO:BP", "GO:MF", "GO:CC")){
   genes <- unique(genes)
   genes <- matrix(genes)
   
@@ -321,7 +407,31 @@ gophr_broke <- function(genes, burrow=FALSE, waffle=NULL, tunnel=FALSE, go_class
 
 
 
-
+get_down <- function(go_terms, go_class='BP', direction='over', slim_file = 'goslim_generic.obo', evidenceCode="TAS"){
+  myCollection <- GOCollection(go_terms)
+  
+  slim <- getOBOCollection(slim_file)
+  slim_counts <- goSlim(myCollection, slim, go_class, evidenceCode %in% evidenceCode)
+  slim_counts <- slim_counts %>% 
+    dplyr::filter(Count > 0)
+  
+  
+  fill_col <- '#3B8FC7'
+  if(direction=='under'){
+    fill_col <- '#BF3131'
+  }
+  
+  title <- paste0(direction, "-represented ", go_class, " terms")
+  
+  p <- ggplot(slim_counts)
+  p <- p + geom_bar(aes(fct_reorder(Term, Percent), Percent, fill=fill_col), stat='identity')
+  p <- p + scale_x_discrete("Percentage")
+  p <- p + coord_flip()
+  p <- p + theme(axis.title.y = element_blank()) + cleanTheme()
+  p <- p + scale_fill_identity()
+  p <- p + ggtitle(title)
+  p
+}
 
 
 
